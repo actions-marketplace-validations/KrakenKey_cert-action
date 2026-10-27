@@ -17,11 +17,37 @@ Issue, renew, or download TLS certificates from [KrakenKey](https://krakenkey.io
     domain: api.example.com
 ```
 
+### Without a stored API key (GitHub OIDC)
+
+Leave out `api-key` and let the job request a GitHub OIDC token instead. The action exchanges it for a KrakenKey key that lasts 15 minutes, so there is no long-lived secret to store or rotate.
+
+1. In the KrakenKey dashboard, under **API Keys → GitHub Actions**, add a trust policy for the repository (`owner/name`). Optionally limit it to branches or tags (`refs/heads/main`, `refs/tags/v*`), a GitHub environment, scopes (for example **Certificate renewal**), and specific domains or certificates.
+2. Give the job permission to request the token:
+
+```yaml
+jobs:
+  cert:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: krakenkey/cert-action@v1
+        with:
+          command: renew
+          cert-id: '42'
+          if-due: 'true'
+```
+
+The repository's numeric id is pinned the first time a token is exchanged, so a repository deleted and re-created under the same name is refused. Pull requests from forks never receive an OIDC token. If you trust a repository from more than one KrakenKey account, set `trust-id` to the policy's id.
+
 ## Inputs
 
 | Input | Description | Required | Default |
 |-------|-------------|----------|---------|
-| `api-key` | KrakenKey API key (starts with `kk_`). Store as `KRAKENKEY_API_KEY` in repository secrets. | Yes | — |
+| `api-key` | KrakenKey API key (starts with `kk_`). Store as `KRAKENKEY_API_KEY` in repository secrets. Leave empty to use GitHub OIDC. | No | `""` |
+| `oidc-audience` | Audience for the GitHub OIDC token when `api-key` is empty. Must match the KrakenKey API | No | `https://api.krakenkey.io` |
+| `trust-id` | Trust policy id, only needed when several KrakenKey trust policies match this repository | No | `""` |
 | `api-url` | KrakenKey API base URL | No | `https://api.krakenkey.io` |
 | `command` | Action to perform: `issue`, `renew`, or `download` | No | `issue` |
 | `domain` | Primary domain (CN) for the certificate | `issue` only | — |
@@ -33,6 +59,7 @@ Issue, renew, or download TLS certificates from [KrakenKey](https://krakenkey.io
 | `auto-renew` | Enable server-side auto-renewal | No | `true` |
 | `cert-id` | Certificate ID for `renew` or `download` commands | `renew`/`download` | — |
 | `wait` | Wait for issuance/renewal to complete | No | `true` |
+| `if-due` | For `renew`: only renew when the certificate is inside your plan's renewal window; otherwise leave it and set `renewed` to `false`. Use this for scheduled workflows. Needs CLI v0.7.0 or later | No | `false` |
 | `poll-interval` | Poll interval when waiting (Go duration, e.g., `15s`) | No | `15s` |
 | `poll-timeout` | Maximum time to wait (Go duration, e.g., `10m`) | No | `10m` |
 | `cert-path` | Path to save the leaf certificate PEM | No | `./cert.pem` |
@@ -48,6 +75,7 @@ Issue, renew, or download TLS certificates from [KrakenKey](https://krakenkey.io
 |--------|-------------|
 | `cert-id` | Certificate ID |
 | `status` | Certificate status (`pending`, `issuing`, `issued`, `failed`) |
+| `renewed` | For `renew`: `true` if a renewal ran, `false` if `if-due` found the certificate was not due yet |
 | `domain` | Primary domain (CN) |
 | `sans` | Subject Alternative Names (comma-separated) |
 | `issuer` | Certificate issuer (e.g., `CN=R11,O=Let's Encrypt,C=US`) |
@@ -74,6 +102,16 @@ Generates a CSR locally, submits it to the KrakenKey API, waits for issuance (~4
 
 Triggers renewal of an existing certificate by ID, waits for completion, and downloads the new certificate and chain files.
 
+Without `if-due`, every run issues a new certificate and counts against your monthly limit. For scheduled workflows set `if-due: true`: the certificate is renewed only once it is inside your plan's renewal window (5 days on Free, 30 days on paid plans). On other runs nothing is renewed, the current certificate is still downloaded to the output paths, and the `renewed` output is `false`, so later steps can skip deploying. If a renewal is already running (started by KrakenKey, the dashboard or another workflow), krakenkey-cli v0.8.2 and later wait for it and download its result instead of skipping; older releases skip it with `renewed: false`.
+
+If the renewal fails, the step fails and nothing is downloaded. When the current certificate is still valid, KrakenKey keeps it after a failed renewal: it stays `issued` with the old certificate, and KrakenKey records the reason. The action checks for this after waiting (it compares the certificate before and after the renewal), so it works with any `cli-version`:
+
+```
+Error: Renewal of certificate 42 failed: CAA record for example.com prevents issuance. The current certificate is still in place (expires 2026-11-20T10:00:00Z). Fix the cause, then run renew again or retry the certificate in KrakenKey.
+```
+
+With `wait: false` the action does not wait, so it can't tell; check the certificate later with `command: download` or in the dashboard.
+
 **Required inputs:** `api-key`, `cert-id`
 
 ### `download`
@@ -95,6 +133,16 @@ The `issue`, `renew`, and `download` commands all produce three certificate outp
 Most web servers (nginx, Apache, HAProxy, Caddy) expect the **full chain**. Use `fullchain-path` in your deploy steps. Use `cert-path` alone only if your server manages the chain separately.
 
 The `cert-path`, `chain-path`, and `fullchain-path` outputs give absolute paths suitable for use in downstream `scp`, `kubectl`, or secrets manager upload steps.
+
+### Why not the leaf alone?
+
+If a server sends only the leaf, some clients fill in the missing intermediate themselves: Windows and macOS fetch it from the URL in the certificate's Authority Information Access (AIA) extension, and Firefox ships a preloaded set of intermediates. Many others do not, including OpenSSL and tools built on it such as `curl` on Linux, Go on Linux, and Java with default settings. That is why a leaf-only deploy can look fine in a browser and still fail with `unable to get local issuer certificate` (OpenSSL) or `x509: certificate signed by unknown authority` (Go). CA/Browser Forum ballot SC104 (passed 2026-09-03) makes the AIA extension optional in subscriber certificates, so that fallback will get less reliable over time.
+
+Deploying `fullchain-path` avoids the problem. To check what a server actually sends, use a client that does not repair chains:
+
+```bash
+openssl s_client -connect api.example.com:443 -servername api.example.com -verify_return_error </dev/null
+```
 
 ## Usage Examples
 
@@ -123,7 +171,7 @@ jobs:
 
       - name: Deploy with certificate
         run: |
-          scp ${{ steps.cert.outputs.cert-path }} server:/etc/ssl/certs/
+          scp ${{ steps.cert.outputs.fullchain-path }} server:/etc/ssl/certs/
           scp ${{ steps.cert.outputs.key-path }} server:/etc/ssl/private/
           ssh server 'systemctl reload nginx'
 ```
@@ -207,7 +255,7 @@ jobs:
 name: Certificate Renewal
 on:
   schedule:
-    - cron: '0 6 * * 1'  # Every Monday at 6 AM
+    - cron: '0 6 * * *'  # Daily at 6 AM; if-due renews only when due
 
 jobs:
   renew:
@@ -225,9 +273,10 @@ jobs:
           api-key: ${{ secrets.KRAKENKEY_API_KEY }}
           command: renew
           cert-id: ${{ matrix.cert.id }}
+          if-due: true
 
       - name: Deploy renewed cert
-        if: steps.cert.outputs.status == 'issued'
+        if: steps.cert.outputs.renewed == 'true'
         run: |
           echo "Renewed ${{ matrix.cert.name }} — expires ${{ steps.cert.outputs.expires }}"
 ```
@@ -277,7 +326,8 @@ jobs:
 
 ## Security
 
-- **API key masking** — The API key is masked with `::add-mask::` as the very first operation, ensuring it is redacted from all log output.
+- **API key masking** — The API key is masked with `::add-mask::` as the very first operation, ensuring it is redacted from all log output. With GitHub OIDC, the OIDC token and the short-lived key are masked as soon as they are received.
+- **GitHub OIDC** — With no `api-key`, nothing long-lived is stored: each run gets a key that expires after 15 minutes and is limited to what the repository's trust policy allows.
 - **API key not in process list** — The CLI is invoked with the `KK_API_KEY` environment variable instead of a `--api-key` flag, so the key does not appear in `ps` output.
 - **Private key permissions** — Private key files are written with `chmod 0600`. The action does NOT upload artifacts — deploying or storing the private key securely is the user's responsibility.
 - **Checksum verification** — The CLI binary is verified against goreleaser SHA-256 checksums before execution, protecting against CDN/mirror compromise.
@@ -293,13 +343,36 @@ jobs:
 | `Certificate or resource not found` | Invalid `cert-id` | Check certificate ID in KrakenKey dashboard |
 | `Rate limited` | Too many API requests | Wait and retry, or upgrade your KrakenKey plan |
 | `Invalid api-key format` | API key doesn't start with `kk_` | Use the API key from your KrakenKey dashboard |
-| Timeout during issuance | DNS-01 challenge took too long | Check domain DNS configuration; increase `poll-timeout` |
+| `ACME challenge delegation missing` | No `_acme-challenge` CNAME for one of the names on the certificate | Create the CNAME named in the error (see [ACME challenge delegation](#acme-challenge-delegation)), then request the certificate again |
+| `ACME challenge delegation mismatch` | The `_acme-challenge` CNAME points somewhere else | Change the CNAME to the target named in the error, then request the certificate again |
+| `Renewal of certificate <id> failed: <reason>. The current certificate is still in place` | The renewal failed in KrakenKey, and KrakenKey kept the current, still valid certificate. Nothing was downloaded | Fix the cause named in the message, then run `renew` again, or retry the certificate in the dashboard and fetch it with `command: download`. Without a retry, KrakenKey tries again on its own after about a day |
+| `timed out after 10m0s waiting for certificate <id>` | The action stopped waiting after `poll-timeout` (default `10m`). KrakenKey keeps working on the request. Issuance usually takes 2 to 5 minutes, and each extra name in `san` adds DNS validation time | For `issue`: raise `poll-timeout` (for example `20m`) and run again. The timed-out request still counts against your plan limits, and its private key stayed on the runner, so it can't be reused. For `renew`: don't run `renew` again (the API only renews certificates in `issued` state). Wait until the certificate shows as issued, then fetch it with `command: download` and the same `cert-id` |
+
+### ACME challenge delegation
+
+KrakenKey answers the ACME DNS-01 challenge in its own DNS zone, so every name on the certificate (`domain` and each `san` entry) needs a one-time CNAME that delegates its `_acme-challenge` name to KrakenKey. This is separate from the TXT record that verifies domain ownership. The dashboard shows the exact target for each name.
+
+| Name on the certificate | CNAME at | Target |
+|-------------------------|----------|--------|
+| `example.com` | `_acme-challenge.example.com` | `example-com.acme.krakenkey.io` |
+| `api.example.com` | `_acme-challenge.api.example.com` | `api-example-com.acme.krakenkey.io` |
+| `*.example.com` | `_acme-challenge.example.com` | `example-com.acme.krakenkey.io` |
+
+The target is the name with dots replaced by dashes, under `acme.krakenkey.io`. A wildcard uses the same record as its base name. CNAME chains are followed, so you can delegate through an intermediate name.
+
+KrakenKey checks these records before it asks Let's Encrypt for a certificate. A missing or wrong record fails the step within the first poll or two instead of running until `poll-timeout`, and KrakenKey does not retry it, because only a DNS change can fix it. After fixing DNS:
+
+- `issue`: run the workflow again. If you only just created the record, allow a few minutes for DNS to update.
+- `renew`: if the current certificate is still valid, KrakenKey keeps it (status `issued`, with the reason recorded), so you can run `renew` again once DNS is fixed. If it had already expired, the certificate is now in `failed` state, and `renew` only accepts `issued` certificates, so running `renew` again won't help. Retry it from the dashboard or with `krakenkey cert retry <id>`, then fetch it with `command: download`.
+
+To check the records before running a workflow, use `krakenkey domain check example.com '*.example.com'` (CLI v0.5.0 or later) or `dig CNAME _acme-challenge.example.com +short`.
 
 ## Prerequisites
 
 1. A [KrakenKey](https://krakenkey.io) account
 2. A verified domain in your KrakenKey dashboard
-3. An API key (starts with `kk_`) stored as a GitHub Actions secret
+3. An `_acme-challenge` CNAME for each name on the certificate, delegating ACME challenges to KrakenKey. See [ACME challenge delegation](#acme-challenge-delegation)
+4. An API key (starts with `kk_`) stored as a GitHub Actions secret
 
 ## License
 

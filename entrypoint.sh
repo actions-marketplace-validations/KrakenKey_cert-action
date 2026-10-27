@@ -2,15 +2,15 @@
 set -euo pipefail
 
 # ── 1. Mask secrets ──────────────────────────────────────────────
-echo "::add-mask::${INPUT_API_KEY}"
+mask_secrets() {
+  if [[ -n "${INPUT_API_KEY:-}" ]]; then
+    echo "::add-mask::${INPUT_API_KEY}"
+  fi
+}
 
 # ── 2. Validate inputs ──────────────────────────────────────────
 validate_inputs() {
-  if [[ -z "${INPUT_API_KEY}" ]]; then
-    echo "::error::Missing required input: api-key"
-    exit 1
-  fi
-  if [[ ! "${INPUT_API_KEY}" =~ ^kk_ ]]; then
+  if [[ -n "${INPUT_API_KEY:-}" && ! "${INPUT_API_KEY}" =~ ^kk_ ]]; then
     echo "::error::Invalid api-key format — must start with 'kk_'"
     exit 1
   fi
@@ -33,6 +33,64 @@ validate_inputs() {
       exit 1
       ;;
   esac
+}
+
+# ── 2b. GitHub OIDC ──────────────────────────────────────────────
+# Without an api-key, exchange the job's GitHub OIDC token for a KrakenKey
+# key that lasts 15 minutes and carries the trust policy's limits.
+resolve_api_key() {
+  if [[ -n "${INPUT_API_KEY:-}" ]]; then
+    return 0
+  fi
+  if [[ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" || -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]]; then
+    echo "::error::No api-key given and GitHub OIDC is not available. Either pass api-key, or add 'permissions: id-token: write' to the job and create a trust policy for this repository in the KrakenKey dashboard."
+    exit 1
+  fi
+
+  local audience token body response status message
+  audience=$(jq -rn --arg a "${INPUT_OIDC_AUDIENCE:-https://api.krakenkey.io}" '$a | @uri')
+  if ! token=$(curl -fsS -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+      "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${audience}" | jq -r '.value // empty'); then
+    token=""
+  fi
+  if [[ -z "${token}" ]]; then
+    echo "::error::Could not get a GitHub OIDC token for this job."
+    exit 1
+  fi
+  echo "::add-mask::${token}"
+
+  body=$(jq -cn --arg t "${token}" --arg id "${INPUT_TRUST_ID:-}" \
+    '{token: $t} + (if $id == "" then {} else {trustId: $id} end)')
+  response=$(curl -sS -w '\n%{http_code}' -X POST \
+    -H 'Content-Type: application/json' --data "${body}" \
+    "${INPUT_API_URL%/}/auth/github-oidc") || {
+    echo "::error::Could not reach ${INPUT_API_URL} to exchange the GitHub OIDC token."
+    exit 1
+  }
+  status=$(tail -n1 <<<"${response}")
+  body=$(sed '$d' <<<"${response}")
+  if [[ "${status}" != "200" ]]; then
+    message=$(jq -r '.message // empty' <<<"${body}" 2>/dev/null || true)
+    case "${status}" in
+      401) echo "::error::KrakenKey rejected the GitHub OIDC token (${message:-invalid token}). Check that oidc-audience matches the KrakenKey API." ;;
+      # The API's messages have no final period; add one before the hint.
+      403) message=${message:-No KrakenKey trust policy matches this repository}
+           echo "::error::${message%.}. Create one in the KrakenKey dashboard, or check its branch, tag and environment conditions." ;;
+      409) message=${message:-Several trust policies match this repository}
+           echo "::error::${message%.}. Set the trust-id input to one of: $(jq -r '.trustIds // [] | join(", ")' <<<"${body}" 2>/dev/null)" ;;
+      *)   echo "::error::GitHub OIDC exchange failed with HTTP ${status}${message:+: ${message}}" ;;
+    esac
+    exit 1
+  fi
+
+  INPUT_API_KEY=$(jq -r '.apiKey // empty' <<<"${body}")
+  if [[ ! "${INPUT_API_KEY}" =~ ^kk_ ]]; then
+    echo "::error::GitHub OIDC exchange returned no API key."
+    exit 1
+  fi
+  echo "::add-mask::${INPUT_API_KEY}"
+  export INPUT_API_KEY
+  echo "Authenticated with GitHub OIDC (key valid until $(jq -r '.expiresAt' <<<"${body}"))." >&2
 }
 
 # ── 3. Download CLI binary ───────────────────────────────────────
@@ -70,6 +128,24 @@ download_cli() {
 }
 
 # ── 4. Execute command ───────────────────────────────────────────
+# Split the comma-separated san input into one "--san <name>" pair per line.
+# The CLI takes repeated --san flags and does not split values itself, so
+# passing the raw input would request a single SAN like "a.com,b.com".
+# Whitespace around each name is trimmed, empty entries are dropped, and
+# newlines are accepted as separators too.
+san_args() {
+  local raw="${1//$'\n'/,}" entry
+  local -a entries=()
+  IFS=',' read -r -a entries <<< "${raw}"
+  for entry in "${entries[@]}"; do
+    entry="${entry#"${entry%%[![:space:]]*}"}"
+    entry="${entry%"${entry##*[![:space:]]}"}"
+    if [[ -n "${entry}" ]]; then
+      printf '%s\n' --san "${entry}"
+    fi
+  done
+}
+
 execute_issue() {
   local args=(
     --api-url "${INPUT_API_URL}"
@@ -86,9 +162,17 @@ execute_issue() {
     --chain-out "${INPUT_CHAIN_PATH}"
     --fullchain-out "${INPUT_FULLCHAIN_PATH}"
   )
-  [[ "${INPUT_AUTO_RENEW}" == "true" ]] && args+=(--auto-renew)
+  # Always pass the value: the API turns auto-renew on by default, so leaving
+  # the flag out for 'false' would leave it on.
+  if [[ "${INPUT_AUTO_RENEW,,}" == "false" ]]; then
+    args+=(--auto-renew=false)
+  else
+    args+=(--auto-renew=true)
+  fi
   [[ "${INPUT_WAIT}" == "true" ]] && args+=(--wait)
-  [[ -n "${INPUT_SAN}" ]] && args+=(--san "${INPUT_SAN}")
+  local -a sans=()
+  mapfile -t sans < <(san_args "${INPUT_SAN:-}")
+  args+=("${sans[@]}")
   [[ -n "${INPUT_SUBJECT_ORG}" ]] && args+=(--org "${INPUT_SUBJECT_ORG}")
   [[ -n "${INPUT_SUBJECT_OU}" ]] && args+=(--ou "${INPUT_SUBJECT_OU}")
   [[ -n "${INPUT_SUBJECT_COUNTRY}" ]] && args+=(--country "${INPUT_SUBJECT_COUNTRY}")
@@ -96,24 +180,78 @@ execute_issue() {
   KK_API_KEY="${INPUT_API_KEY}" krakenkey "${args[@]}"
 }
 
+# Prints "false" when the CLI reported a skipped renewal (--if-due and the
+# certificate is outside the renewal window), otherwise "true". The CLI's JSON
+# output can hold several documents (e.g. a warning before the result).
+renew_outcome() {
+  if echo "$1" | jq -se 'any(.[]; type == "object" and .skipped == true)' >/dev/null 2>&1; then
+    echo "false"
+  else
+    echo "true"
+  fi
+}
+
+# Prints the certificate as JSON (krakenkey cert show), or nothing when it
+# can't be read.
+show_cert() {
+  KK_API_KEY="${INPUT_API_KEY}" krakenkey \
+    --api-url "${INPUT_API_URL}" \
+    --output json \
+    --no-color \
+    cert show "$1" 2>/dev/null | jq -cs 'map(select(type == "object" and has("id"))) | last // empty' 2>/dev/null || true
+}
+
+# Fails the step when a renewal the action waited for left the certificate
+# issued with the same leaf as before: KrakenKey keeps a still-valid
+# certificate after a failed renewal (status issued, renewalFailedAt and
+# failureReason set) instead of moving it to failed. CLI releases that know
+# about this already exit 1; this also covers older ones (cli-version).
+# $1 is the leaf PEM from before the renewal; empty skips the check.
+check_renewal_result() {
+  local before_pem="$1" after reason expires
+  [[ -n "${before_pem}" ]] || return 0
+  after=$(show_cert "${INPUT_CERT_ID}")
+  [[ -n "${after}" ]] || return 0
+  if [[ "$(jq -r '.status // empty' <<<"${after}")" != "issued" ]] ||
+     [[ "$(jq -r '.crtPem // empty' <<<"${after}")" != "${before_pem}" ]]; then
+    return 0
+  fi
+  reason=$(jq -r '.failureReason // empty' <<<"${after}")
+  expires=$(jq -r '.expiresAt // empty' <<<"${after}")
+  echo "::error::Renewal of certificate ${INPUT_CERT_ID} failed${reason:+: ${reason}}. The current certificate is still in place${expires:+ (expires ${expires})}. Fix the cause, then run renew again or retry the certificate in KrakenKey." >&2
+  return 1
+}
+
 execute_renew() {
-  local result rc=0 wait_args=()
-  [[ "${INPUT_WAIT}" == "true" ]] && wait_args+=(--wait)
+  local result rc=0 renew_args=() workdir before_pem=""
+  [[ "${INPUT_WAIT}" == "true" ]] && renew_args+=(--wait)
+  [[ "${INPUT_IF_DUE:-false}" == "true" ]] && renew_args+=(--if-due)
+  # CLI v0.7.0+ saves ./<cn>.crt and friends after renew --wait. The action
+  # downloads to its own output paths below, so run renew in a scratch
+  # directory to keep those copies out of the workspace.
+  if [[ "${INPUT_WAIT}" == "true" ]]; then
+    before_pem=$(jq -r '.crtPem // empty' <<<"$(show_cert "${INPUT_CERT_ID}")" 2>/dev/null || true)
+  fi
+  workdir=$(mktemp -d "${RUNNER_TEMP:-/tmp}/krakenkey-renew.XXXXXX")
   # Capture output but never let a CLI failure abort before we can print it.
   # Under set -e, a plain result=$(...) exits on failure and the CLI's error
   # message (stdout in --output json mode) is lost with it.
-  result=$(KK_API_KEY="${INPUT_API_KEY}" krakenkey \
+  result=$(cd "${workdir}" && KK_API_KEY="${INPUT_API_KEY}" krakenkey \
     --api-url "${INPUT_API_URL}" \
     --output json \
     --no-color \
     cert renew "${INPUT_CERT_ID}" \
-    "${wait_args[@]}" \
+    "${renew_args[@]}" \
     --poll-interval "${INPUT_POLL_INTERVAL}" \
     --poll-timeout "${INPUT_POLL_TIMEOUT}") || rc=$?
+  rm -rf "${workdir}"
   echo "${result}"
   if [[ "${rc}" -ne 0 ]]; then
-    echo "::error::krakenkey cert renew exited with code ${rc}"
+    echo "::error::krakenkey cert renew exited with code ${rc}" >&2
     exit "${rc}"
+  fi
+  if [[ "${INPUT_WAIT}" == "true" && "$(renew_outcome "${result}")" == "true" ]]; then
+    check_renewal_result "${before_pem}" || exit 1
   fi
 
   # With --wait the CLI prints the initial response ("renewing") and only
@@ -170,6 +308,15 @@ execute_download() {
     cert download "${INPUT_CERT_ID}" \
     --format fullchain \
     --out "${INPUT_FULLCHAIN_PATH}" 2>/dev/null || true
+
+  # cert download prints where it saved the file, not the certificate, so
+  # finish with the certificate itself for set_outputs (cert-id, status, and
+  # the details behind expires, domain and the rest).
+  KK_API_KEY="${INPUT_API_KEY}" krakenkey \
+    --api-url "${INPUT_API_URL}" \
+    --output json \
+    --no-color \
+    cert show "${INPUT_CERT_ID}"
 }
 
 # ── 5. Parse output and set Action outputs ───────────────────────
@@ -177,13 +324,19 @@ set_outputs() {
   local result="$1"
   local cert_id status
 
-  cert_id=$(echo "${result}" | jq -r '.id // empty')
-  status=$(echo "${result}" | jq -r '.status // empty')
+  # Take the last JSON document that carries the field; the CLI may print a
+  # warning document first.
+  cert_id=$(echo "${result}" | jq -rs 'map(select(type == "object" and has("id"))) | last | .id // empty' 2>/dev/null || true)
+  status=$(echo "${result}" | jq -rs 'map(select(type == "object" and has("status"))) | last | .status // empty' 2>/dev/null || true)
 
   {
     echo "cert-id=${cert_id}"
     echo "status=${status}"
   } >> "${GITHUB_OUTPUT}"
+
+  if [[ "${INPUT_COMMAND}" == "renew" ]]; then
+    echo "renewed=$(renew_outcome "${result}")" >> "${GITHUB_OUTPUT}"
+  fi
 
   if [[ "${status}" == "issued" ]]; then
     local details
@@ -226,7 +379,7 @@ handle_error() {
   local exit_code="$1"
   case "${exit_code}" in
     0) return 0 ;;
-    2) echo "::error::Authentication failed — verify KRAKENKEY_API_KEY secret is set and valid" ;;
+    2) echo "::error::Authentication failed — verify the api-key secret is set and valid, or that the GitHub OIDC trust policy grants this command's scopes" ;;
     3) echo "::error::Certificate or resource not found — check cert-id input" ;;
     4) echo "::error::Rate limited by KrakenKey API — wait and retry, or upgrade your plan" ;;
     5) echo "::error::Configuration error — check action inputs" ;;
@@ -237,7 +390,9 @@ handle_error() {
 
 # ── Main ─────────────────────────────────────────────────────────
 main() {
+  mask_secrets
   validate_inputs
+  resolve_api_key
   download_cli
 
   local result=""
@@ -280,4 +435,7 @@ main() {
   fi
 }
 
-main "$@"
+# Only run when executed directly, so tests can source this file.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi
